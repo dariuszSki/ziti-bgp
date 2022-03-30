@@ -13,7 +13,7 @@
 package main
 
 import (
-	"ziti-bgp/cmd"
+	"../ziti-bgp/cmd"
 )
 
 func main() {
