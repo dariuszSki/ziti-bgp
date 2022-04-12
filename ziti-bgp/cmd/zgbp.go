@@ -1,27 +1,9 @@
-/*
-	Copyright NetFoundry, Inc.
-	Licensed under the Apache License, Version 2.0 (the "License");
-	you may not use this file except in compliance with the License.
-	You may obtain a copy of the License at
-	https://www.apache.org/licenses/LICENSE-2.0
-	Unless required by applicable law or agreed to in writing, software
-	distributed under the License is distributed on an "AS IS" BASIS,
-	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
-	limitations under the License.
-*/
-
 package cmd
 
 import (
 	"context"
 	"github.com/coreos/go-iptables/iptables"
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/michaelquigley/pfxlog"
 	gobgpApi "github.com/osrg/gobgp/v3/api"
-	"github.com/osrg/gobgp/v3/pkg/config"
-	"github.com/osrg/gobgp/v3/pkg/server"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,10 +11,8 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -47,30 +27,21 @@ type contextLogData struct {
 	value error
 }
 
-func init() {
-	options := pfxlog.DefaultOptions().SetTrimPrefix("github.com/netfoundry/ziti-bgp").SetAbsoluteTime().Color()
-	options.DataFielder = func(v interface{}, l *logrus.Entry) *logrus.Entry {
-		cd, ok := v.(*contextLogData)
-		if ok {
-			return l.WithFields(map[string]interface{}{
-				"topic": cd.topic,
-				"value": cd.value,
-			})
-		} else {
-			return l.WithFields(nil)
-		}
-	}
-	pfxlog.GlobalInit(logrus.InfoLevel, options)
+type optsGobgpd struct {
+	ConfigFile      string
+	ConfigType      string
+	LogLevel        string
+	GrpcHosts       string
+	GracefulRestart bool
+	UseSdNotify     bool
 }
 
-var log = pfxlog.Logger()
-
 func readIptablesChain(ipt *iptables.IPTables, table, srcChain, dstChain string) []string {
-	log.Debugf("checking iptables '%v' link '%v' --> '%v'", table, srcChain, dstChain)
+	logger.Debugf("checking iptables '%v' link '%v' --> '%v'", table, srcChain, dstChain)
 
 	ruleList, err := ipt.List(table, dstChain)
 	if err != nil {
-		log.WithError(err).Error("failed to unlink chain")
+		logger.WithError(err).Error("failed to unlink chain")
 	}
 	return ruleList
 }
@@ -88,7 +59,7 @@ func getAsn(path string) string {
 	pathList := strings.Fields(path)
 	for _, pathElement := range pathList {
 		if strings.Split(pathElement, ":")[0] == "local_identifier" {
-			log.Debugf(strings.Split(pathElement, ":")[1])
+			logger.Debugf(strings.Split(pathElement, ":")[1])
 		}
 		if strings.Split(pathElement, ":")[0] == "asn" || strings.Split(pathElement, ":")[0] == "source_asn" {
 			return strings.Split(pathElement, ":")[1]
@@ -104,7 +75,7 @@ func getRoutes(pl chan []string, dbscantime *int) {
 
 		ipt, err := iptables.New()
 		if err != nil {
-			log.Infof("Failed to initialize iptables handle")
+			logger.Infof("Failed to initialize iptables handle")
 		}
 		rules := readIptablesChain(ipt, mangleTable, srcChain, dstChain)
 		gobgpList := []string{}
@@ -128,114 +99,75 @@ func getRoutes(pl chan []string, dbscantime *int) {
 		}
 
 		pl <- gobgpList
-		log.WithFields(map[string]interface{}{"function": "getRoutes"}).Debugf("routes to advertise %v", gobgpList)
+		logger.WithFields(map[string]interface{}{"function": "getRoutes"}).Debugf("routes to advertise %v", gobgpList)
 
 		deadline2 := time.Now().Add(1000 * time.Millisecond)
-		log.Infof("get routes: duration %v", deadline2.Sub(deadline))
+		logger.Infof("get routes: duration %v", deadline2.Sub(deadline))
 
-		log.WithFields(map[string]interface{}{"function": "getRoutes"}).Warnf("sleeping for %d s before looping again", *dbscantime)
+		logger.WithFields(map[string]interface{}{"function": "getRoutes"}).Warnf("sleeping for %d s before looping again", *dbscantime)
 		time.Sleep(time.Duration(*dbscantime) * time.Second)
 
 	}
 
 }
 
-func stopServer(bgpServer *server.BgpServer, useSdNotify bool) {
-	log.Info("stopping gobgpd server")
-
-	bgpServer.Stop()
-	if useSdNotify {
-		daemon.SdNotify(false, daemon.SdNotifyStopping)
-	}
+func init() {
+	rootCmd.AddCommand(clientCmd)
+	clientCmd.AddCommand(serverCmd)
+	serverCmd.Flags().StringP("config-file", "c", "", "specifying a config file")
+	serverCmd.Flags().StringP("config-type", "t", "toml", "specifying config type (toml, yaml, json)")
+	serverCmd.Flags().StringP("api-hosts", "a", ":50051", "specify the hosts that gobgpd listens on")
+	serverCmd.Flags().BoolP("graceful-restart", "r", true, "flag restart-state in graceful-restart capability")
+	serverCmd.Flags().BoolP("sdnotify", "n", true, "use sd_notify protocol")
 }
 
-var clientCmd = &cobra.Command{
-	Use:   "client",
-	Short: "zbgp client command",
-	Long: `This command runs zbgp in client mode which will look up the iptables chain named NF-INTERCEPTS
+var (
+	clientCmd = &cobra.Command{
+		Use:   "client",
+		Short: "zbgp client command",
+		Long: `This command runs zbgp in client mode which will look up the iptables chain named NF-INTERCEPTS
 and update the gobgp server with the routes generated by the ziti services`,
-	Run: zgbp,
-}
+		PreRun: zlogs,
+		Run:    zgbp,
+	}
+	serverCmd = &cobra.Command{
+		Use:    "server",
+		Short:  "gobgp server command",
+		Long:   `This command runs gobgp in server mode that the client can use a a bgp speaker to neighbors`,
+		PreRun: zlogs,
+		Run:    zgbp,
+	}
+)
 
 func zgbp(cmd *cobra.Command, args []string) {
+
 	cflag, _ := cmd.Flags().GetString("config-file")
 	tflag, _ := cmd.Flags().GetString("config-type")
-	lflag, _ := cmd.Flags().GetString("log-level")
 	aflag, _ := cmd.Flags().GetString("api-hosts")
 	rflag, _ := cmd.Flags().GetBool("graceful-restart")
 	nflag, _ := cmd.Flags().GetBool("sdnotify")
 
-	var opts struct {
-		ConfigFile      string
-		ConfigType      string
-		LogLevel        string
-		GrpcHosts       string
-		GracefulRestart bool
-		UseSdNotify     bool
-	}
-
+	var opts optsGobgpd
 	opts.ConfigFile = cflag
 	opts.ConfigType = tflag
-	opts.LogLevel = lflag
 	opts.GrpcHosts = aflag
 	opts.GracefulRestart = rflag
 	opts.UseSdNotify = nflag
 
-	switch opts.LogLevel {
-	case "debug":
-		logrus.SetLevel(logrus.DebugLevel)
-	case "info":
-		logrus.SetLevel(logrus.InfoLevel)
-	default:
-		logrus.SetLevel(logrus.InfoLevel)
+	if opts.ConfigFile != "" {
+		go func() {
+			zgbpd(opts)
+		}()
+		time.Sleep(15 * time.Second)
 	}
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-
-	maxSize := 256 << 20
-	grpcOpts := []grpc.ServerOption{grpc.MaxRecvMsgSize(maxSize), grpc.MaxSendMsgSize(maxSize)}
-	log.Info(opts.GrpcHosts)
-	log.Info("gobgpd started")
-	s := server.NewBgpServer(server.GrpcListenAddress(opts.GrpcHosts), server.GrpcOption(grpcOpts))
-	go s.Serve()
-
-	if opts.UseSdNotify {
-		if status, err := daemon.SdNotify(false, daemon.SdNotifyReady); !status {
-			if err != nil {
-				log.Warnf("Failed to send notification via sd_notify(): %s", err)
-			} else {
-				log.Warnf("The socket sd_notify() isn't available")
-			}
-		}
-	}
-	if opts.ConfigFile == "" {
-		log.Error("Configuration file not provided")
-		stopServer(s, opts.UseSdNotify)
-		os.Exit(0)
-	}
-
-	/* Read the config file for the gobgp server */
-	initialConfig, err := config.ReadConfigFile(opts.ConfigFile, opts.ConfigType)
-	if err != nil {
-		log.Data(&contextLogData{"Config", err}).Fatalf(
-			"Can't read config file %s", opts.ConfigFile)
-	}
-	log.Data(&contextLogData{"Config", nil}).Info("Finished reading the config file")
-	/* Apply the configs to the gobgp server */
-	_, err = config.InitialConfig(context.Background(), s, initialConfig, opts.GracefulRestart)
-	if err != nil {
-		log.Data(&contextLogData{"Config", err}).Fatalf(
-			"Failed to apply initial configuration %s", opts.ConfigFile)
-	}
-
 	conn, err := grpc.DialContext(context.TODO(), ":50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.WithError(err).Error("fail to connect to gobgp")
+		logger.WithError(err).Error("fail to connect to gobgp")
 	}
 	defer func(conn *grpc.ClientConn) {
 		err := conn.Close()
 		if err != nil {
-			log.WithError(err).Error("Check the gobgp api server")
+			logger.WithError(err).Error("Check the gobgp api server")
 		}
 	}(conn)
 
@@ -243,15 +175,14 @@ func zgbp(cmd *cobra.Command, args []string) {
 	client := gobgpApi.NewGobgpApiClient(conn)
 
 	/* requesting bgp global config */
-	//bgpConfig, err := client.GetBgp(context.Background(), &gobgpApi.GetBgpRequest{})
-	bgpConfig, err := s.GetBgp(context.Background(), &gobgpApi.GetBgpRequest{})
+	bgpConfig, err := client.GetBgp(context.Background(), &gobgpApi.GetBgpRequest{})
 	if err != nil {
-		log.WithError(err).Error("fail to get gobgp info with error")
+		logger.WithError(err).Error("fail to get gobgp info with error")
 		os.Exit(1)
 	}
-	log.Data(&contextLogData{"Config", nil}).Debug(bgpConfig.Global.String())
+	logger.Data(&contextLogData{"Config", nil}).Debug(bgpConfig.Global.String())
 	asnLocal := getAsn(bgpConfig.Global.String())
-	log.Info(asnLocal)
+	logger.Info(asnLocal)
 
 	/* announce or withdraw routes */
 	dbscantime := 30
@@ -274,14 +205,6 @@ func zgbp(cmd *cobra.Command, args []string) {
 	})
 	attrs := []*apb.Any{a1, a2, a3}
 
-	/* watch for os signal interrupts to clean up resources and exit gracefully */
-	go func() {
-		select {
-		case <-sigCh:
-			stopServer(s, opts.UseSdNotify)
-			os.Exit(0)
-		}
-	}()
 	/* main for loop */
 
 	for {
@@ -301,7 +224,7 @@ func zgbp(cmd *cobra.Command, args []string) {
 
 		listReader, err = client.ListPath(ctx, &listRequest)
 		if err != nil {
-			log.WithError(err).Error(`could not request the route list client stream `)
+			logger.WithError(err).Error(`could not request the route list client stream `)
 		}
 
 		currentPrefixList := []string{}
@@ -313,26 +236,26 @@ func zgbp(cmd *cobra.Command, args []string) {
 				break
 			}
 			if err != nil {
-				log.WithError(err).Error("errored reading the route table")
+				logger.WithError(err).Error("errored reading the route table")
 			}
 
 			/* Find out if prefix is local or remote */
 			var prefixElements string
 			prefixElements = path.Destination.String()
 			asn := getAsn(prefixElements)
-			log.Debug(prefixElements)
+			logger.Debug(prefixElements)
 			if asn == asnLocal || asn == "" {
 				currentPrefixList = append(currentPrefixList, path.Destination.GetPrefix())
 			}
 		}
 
-		log.Debugf("current local route list: %v", currentPrefixList)
-		log.Debugf("proposed local route list: %v", newPrefixList)
+		logger.Debugf("current local route list: %v", currentPrefixList)
+		logger.Debugf("proposed local route list: %v", newPrefixList)
 
 		/* Add new prefixes if any */
 		for _, prefix := range newPrefixList {
 			if contains(currentPrefixList, prefix) == false {
-				log.Debugf("prefix: %v will be added", prefix)
+				logger.Debugf("prefix: %v will be added", prefix)
 				prefixSplit := strings.Split(prefix, "/")
 				prefixlen, _ := strconv.Atoi(prefixSplit[1])
 				nlri, _ := apb.New(&gobgpApi.IPAddressPrefix{
@@ -340,7 +263,7 @@ func zgbp(cmd *cobra.Command, args []string) {
 					PrefixLen: uint32(prefixlen),
 				})
 
-				_, err := s.AddPath(context.Background(), &gobgpApi.AddPathRequest{
+				_, err := client.AddPath(context.Background(), &gobgpApi.AddPathRequest{
 					Path: &gobgpApi.Path{
 						Family: &gobgpApi.Family{Afi: gobgpApi.Family_AFI_IP, Safi: gobgpApi.Family_SAFI_UNICAST},
 						Nlri:   nlri,
@@ -348,7 +271,7 @@ func zgbp(cmd *cobra.Command, args []string) {
 					},
 				})
 				if err != nil {
-					log.WithError(err).Error("failed to add route path")
+					logger.WithError(err).Error("failed to add route path")
 				}
 			}
 		}
@@ -356,14 +279,14 @@ func zgbp(cmd *cobra.Command, args []string) {
 		/* Delete new prefixes if any */
 		for _, prefix := range currentPrefixList {
 			if contains(newPrefixList, prefix) == false {
-				log.Debugf("prefix: %v will be deleted", prefix)
+				logger.Debugf("prefix: %v will be deleted", prefix)
 				prefixSplit := strings.Split(prefix, "/")
 				prefixlen, _ := strconv.Atoi(prefixSplit[1])
 				nlri, _ := apb.New(&gobgpApi.IPAddressPrefix{
 					Prefix:    prefixSplit[0],
 					PrefixLen: uint32(prefixlen),
 				})
-				err = s.DeletePath(context.Background(), &gobgpApi.DeletePathRequest{
+				_, err = client.DeletePath(context.Background(), &gobgpApi.DeletePathRequest{
 					Path: &gobgpApi.Path{
 						Family: &gobgpApi.Family{Afi: gobgpApi.Family_AFI_IP, Safi: gobgpApi.Family_SAFI_UNICAST},
 						Nlri:   nlri,
@@ -371,23 +294,13 @@ func zgbp(cmd *cobra.Command, args []string) {
 					},
 				})
 				if err != nil {
-					log.WithError(err).Error("failed to delete route path")
+					logger.WithError(err).Error("failed to delete route path")
 				}
 			}
 		}
 
 		deadline2 := time.Now().Add(1000 * time.Millisecond)
-		log.Infof("update global table: duration %v", deadline2.Sub(deadline))
+		logger.Infof("update global table: duration %v", deadline2.Sub(deadline))
 	}
 
-}
-
-func init() {
-	rootCmd.AddCommand(clientCmd)
-	clientCmd.Flags().StringP("config-file", "c", "", "specifying a config file")
-	clientCmd.Flags().StringP("config-type", "t", "toml", "specifying config type (toml, yaml, json)")
-	clientCmd.Flags().StringP("log-level", "l", "Info", "specifying log level")
-	clientCmd.Flags().StringP("api-hosts", "a", ":50051", "specify the hosts that gobgpd listens on")
-	clientCmd.Flags().BoolP("graceful-restart", "r", true, "flag restart-state in graceful-restart capability")
-	clientCmd.Flags().BoolP("sdnotify", "n", true, "use sd_notify protocol")
 }
